@@ -422,12 +422,24 @@ volumes:
 
 | Layer | Control | Applied To | Managed By | Config Location |
 |-------|---------|------------|------------|-----------------|
-| L3/L4 | Cloud Firewall | NodeBalancers/NILs | linode-ccm | traefik-application.yaml |
+| **Network (L3/L4)** |
+| L3/L4 | Cloud Firewall (CFW) | NodeBalancers/NILs | linode-ccm | traefik-application.yaml |
+| L3/L4 | Premium NodeBalancers | Victoria Metrics NILs (ord2/lax3) | Linode | Service annotations |
+| L3/L4 | InfraV6 Firewall | Management Network | terraform-module-infra | InfraV6 IPv6 allocation |
 | L3/L4 | Cilium Host Firewall | Kubernetes Nodes | Cilium Agent | cilium-application.yaml |
 | L3/L4 | Cilium Network Policies | Pod-to-Pod | Cilium Agent | cilium-application.yaml |
+| L3/L4 | BBR TCP Congestion Control | Prometheus Nodes | OS-level | sysctl configuration |
+| **Application (L7)** |
 | L7 | Traefik mTLS | Ingress Traffic | Traefik | traefik-application.yaml |
-| L7 | Envoy mTLS | Cross-Cluster | Envoy Proxy | vmselect-envoy chart |
+| L7 | Envoy mTLS Double-Proxy | Cross-Cluster VictoriaMetrics | Envoy Proxy | vmselect-envoy chart |
 | L7 | EAA | Management Endpoints | Akamai EAA | External |
+| **Identity & Secrets** |
+| - | Vault PKI | Certificate Issuance | Vault | terraform-vault-config |
+| - | Vault AppRole | Kubernetes Service Auth | Vault | provider.tf |
+| - | Certificate Monitoring | Cert Expiration Tracking | Prometheus | grafana-client-cert-collector, vault_pki_exporter |
+| **Performance & Availability** |
+| - | vminsert Concurrency Limits | Resource Exhaustion Prevention | VictoriaMetrics | victoriametrics values |
+| - | ArgoCD Vault Plugin | Secret Injection | ArgoCD | Vault integration |
 
 ---
 
@@ -676,9 +688,164 @@ See: `o11y-helm-charts/hack/envoy/README.md`
 
 ---
 
+## Additional Security Controls
+
+### 5. Certificate Monitoring & Expiration
+
+**Grafana Client Certificate Monitoring:**
+- Custom Prometheus exporter: `grafana-client-cert-collector`
+- Monitors mTLS certificates used for Grafana data sources
+- Metrics exposed: `grafana_client_cert_expiry_seconds`
+- Runbooks: `ops/prometheus_rules` repository
+- Documentation: `terraform-observability-team/docs/content/Services/Grafana/Client Cert Monitoring.md`
+
+**Vault PKI Certificate Monitoring:**
+- Exporter: `vault_pki_exporter`
+- Metrics prefix: `x509_`
+- Monitors high-touch certificates (BAPI, SUDS, intermediates)
+- Vault Kubernetes Auth with JWT-based authentication
+- Documentation: `terraform-observability-team/docs/content/Services/Vault PKI Exporter/vault_pki_exporter.md`
+
+**Certificate Types Monitored:**
+- Traefik ingress mTLS certificates
+- Envoy cross-cluster certificates
+- Vault-issued PKI certificates
+- Grafana datasource client certificates
+- Kubernetes cluster CA certificates (yearly rotation)
+
+---
+
+### 6. Network Performance Optimization
+
+**BBR TCP Congestion Control:**
+- Purpose: Improve Prometheus remote_write reliability to Victoria Metrics
+- Replaces default CUBIC algorithm
+- Better recovery from packet loss and network interruptions
+- Implementation on Prometheus nodes:
+  ```bash
+  modprobe tcp_bbr
+  sysctl -w net.ipv4.tcp_congestion_control=bbr
+  sysctl -w net.core.default_qdisc=fq
+  ```
+- Documentation: `terraform-observability-team/docs/content/proposals/OP-16-BBR-TCP-Control.md`
+
+**Benefits:**
+- Handles 10% packet loss without falling behind
+- Faster socket recovery after network events
+- Improved metrics ingestion reliability
+
+---
+
+### 7. InfraV6 - IPv6 Management Network
+
+**Purpose:** Granular IPv6-based firewall controls for infrastructure management
+
+**Features:**
+- Global unique IPv6 subnet allocation
+- Per-device firewall rules (more granular than traditional overlays)
+- Alternative to VXLAN overlays
+- DNS IPv6 zone support
+- Per-environment prefixes (Dev: "d0", Staging: "50", Prod: standard)
+
+**Implementation:**
+- Terraform configuration in `terraform-module-infra`
+- Network configuration via `new_infra_netreconfig.py`
+- Used for OTLP endpoint routing
+- Documentation: `terraform-observability-team/docs/content/Services/Gecko Observability/infraV6.md`
+
+---
+
+### 8. Vault Integration & Secret Management
+
+**Vault AppRole Authentication:**
+- JWT-based authentication for Kubernetes workloads
+- Short-lived tokens from service accounts
+- Cluster CA certificate validation (rotates yearly)
+- Documentation: `terraform-observability-team/provider.tf`
+
+**Secrets Managed in Vault:**
+- Kubernetes admin kubeconfigs
+- TLS/mTLS certificates via Vault PKI
+- AppRole secret IDs for ArgoCD
+- Loki S3 credentials
+- PagerDuty API tokens
+- GitHub App credentials
+
+**Secret Rotation Procedures:**
+- Kubeconfig rotation: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/rotating-secrets.md`
+- Vault AppRole secret ID rotation
+- Certificate rotation via SDS (Envoy)
+- Automated rotation via cert-manager
+
+---
+
+### 9. Premium NodeBalancer Configuration
+
+**Purpose:** Higher connection limits for Victoria Metrics ingestion
+
+**North American Clusters (ord2, lax3):**
+- Use Premium NodeBalancers (single-tenant)
+- Prevents CPU exhaustion from sustained high-volume remote_write
+- Prevents noisy neighbor issues
+
+**Annotation:**
+```yaml
+service.beta.kubernetes.io/linode-loadbalancer-nodebalancer-type: 'premium'
+```
+
+**Migration Process:**
+- File CSRENETWK ticket for `@firechief-nb`
+- Capacity approval required (limited availability)
+- CCM requires `LINODE_API_VERSION: v4beta`
+- Documentation: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/premium-nodebalancers.md`
+
+---
+
+### 10. Cilium Upgrade & Version Management
+
+**Version Control:**
+- Managed in `o11y-helm-charts` values files
+- Cluster-specific: `cilium.targetRevision`
+- Default version in cilium-application.yaml template
+
+**Upgrade Process:**
+- Single minor version increments only
+- Preflight checks required: `helm install cilium-preflight`
+- Progressive rollout: staging → production
+- Validation via Cilium Agent Metrics dashboard
+- Rollback capability if issues detected
+- Documentation: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/cilium-upgrade.md`
+
+**Security Features Available:**
+- Transparent encryption (Cilium 1.4+)
+- Identity-based network policies
+- ClusterMesh (evaluated but rejected - no VPC/VPN infrastructure)
+
+---
+
+### 11. Victoria Metrics Performance & Security
+
+**vminsert Concurrency Control:**
+- `maxConcurrentInserts` prevents resource exhaustion
+- Regional defaults:
+  - OSA1: 120
+  - LAX3/ORD2: 360 (North American clusters)
+  - Others: 60
+- Protects against Prometheus remote_write backlog
+- Documentation: `terraform-observability-team/docs/content/Services/VictoriaMetrics/vminsert.md`
+
+**Envoy Double-Proxy for mTLS:**
+- Workaround for VictoriaMetrics free version (no native mTLS)
+- HTTP2 CONNECT tunnel with mTLS encryption
+- 6 listeners per global-select cluster (one per LTS cluster, port 11000+)
+- 3 Envoy pods for HA
+- Documentation: `terraform-observability-team/docs/content/Services/VictoriaMetrics/envoy-double-proxy.md`
+
+---
+
 ## References
 
-### Configuration Files
+### Configuration Files (o11y-helm-charts)
 
 - Traefik Application: `o11y-helm-charts/charts/o11y-helm-charts/templates/multi-cluster-applications/traefik-application.yaml`
 - Traefik Helpers: `o11y-helm-charts/charts/o11y-helm-charts/templates/_traefik_helpers.tpl`
@@ -687,22 +854,39 @@ See: `o11y-helm-charts/hack/envoy/README.md`
 - Envoy Config: `o11y-helm-charts/charts/vmselect-envoy/templates/configmap.yaml`
 - Envoy Deployment: `o11y-helm-charts/charts/vmselect-envoy/templates/deployment.yaml`
 
-### Values Files
+### Values Files (o11y-helm-charts)
 
 - Production vmselect: `o11y-helm-charts/values/vmselect-ord2-us-prod`
 - Production Victoria Metrics: `o11y-helm-charts/values/victoriametrics-ord2-us-prod`
 - Production management cluster: `o11y-helm-charts/values/o11y-apps-iad3-us-prod`
 
+### Documentation (terraform-observability-team)
+
+- CCM Firewall: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/ccm-firewall.md`
+- Cilium Upgrade: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/cilium-upgrade.md`
+- Premium NodeBalancers: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/premium-nodebalancers.md`
+- Secret Rotation: `terraform-observability-team/docs/content/Services/Kubernetes Clusters/rotating-secrets.md`
+- Grafana Client Cert Monitoring: `terraform-observability-team/docs/content/Services/Grafana/Client Cert Monitoring.md`
+- Vault PKI Exporter: `terraform-observability-team/docs/content/Services/Vault PKI Exporter/vault_pki_exporter.md`
+- Envoy Double-Proxy: `terraform-observability-team/docs/content/Services/VictoriaMetrics/envoy-double-proxy.md`
+- vminsert Config: `terraform-observability-team/docs/content/Services/VictoriaMetrics/vminsert.md`
+- InfraV6: `terraform-observability-team/docs/content/Services/Gecko Observability/infraV6.md`
+- BBR TCP: `terraform-observability-team/docs/content/proposals/OP-16-BBR-TCP-Control.md`
+- Cilium ClusterMesh (rejected): `terraform-observability-team/docs/content/proposals/OP-07-cilium-clustermesh.md`
+
 ### External Documentation
 
 - Envoy mTLS setup: `o11y-helm-charts/hack/envoy/README.md`
 - Incident retrospective: `#o11y-inc-global-vminsert-and-linmon-connectivity-issues-2024-06-04`
+- Prometheus rules: `ops/prometheus_rules` repository
+- Vault configuration: `ops/terraform-vault-config` repository
+- Infrastructure modules: `ops/terraform-module-infra` repository
 
 ### Related Tickets
 
-- OY-912: Update linode-ccm
-- OY-658: Rework Victoria Metrics alerts
-- (Track Cloud Firewall enable/disable feature request)
+- OY-912: Update linode-ccm to fix rollback bug
+- OY-658: Rework Victoria Metrics alerts to reduce pager fatigue
+- CSRENETWK: Premium NodeBalancer migrations (contact @firechief-nb)
 
 ---
 
