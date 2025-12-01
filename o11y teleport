@@ -1,0 +1,614 @@
+# Teleport Security and Access Control Guide for O11y Infrastructure
+
+## Executive Summary
+
+Teleport is the **primary access mechanism** for all O11y Kubernetes clusters, providing secure, certificate-based authentication and auditable access to infrastructure. It replaces traditional kubectl authentication with a unified access plane that supports:
+
+- **GitHub SSO authentication** - No shared credentials or SSH keys
+- **Short-lived certificates** - 12-hour TTL with automatic expiration
+- **Reverse tunnel architecture** - No need to expose Kubernetes APIs publicly
+- **Complete audit logging** - Every kubectl command is logged with user identity
+- **Role-based access control** - Fine-grained permissions based on GitHub team membership
+
+### Key Facts
+
+| Component | Details |
+|-----------|---------|
+| **Deployment Model** | Control plane on management clusters (o11y-apps), agents on regional clusters |
+| **Authentication** | GitHub SSO with certificate-based access (12h TTL) |
+| **Production Endpoint** | `teleport.infra-o11y-apps.iad3.us.prod.linode.com` |
+| **Staging Endpoint** | `teleport.infra-o11y-apps.rin1.us.staging.linode.com` |
+| **Security Model** | mTLS, certificate-based auth, reverse tunnels, RBAC |
+| **Break-Glass Access** | Admin kubeconfigs stored in Vault at `infra/{env}/sre-o11y/{cluster-name}` |
+
+---
+
+## What is Teleport?
+
+Teleport is an **identity-aware, multi-protocol access proxy** that provides:
+
+### Core Capabilities
+
+1. **Certificate-based authentication** - Eliminates shared secrets and SSH keys
+2. **Single Sign-On (SSO)** - Seamless GitHub authentication integration
+3. **Multi-protocol support** - SSH, Kubernetes API, HTTPS, databases
+4. **Audit logging** - Complete session recording and replay capabilities
+5. **Short-lived certificates** - Automatic certificate expiration (12-hour default)
+6. **Role-based access control (RBAC)** - Fine-grained permissions management
+7. **Zero-trust access** - Identity verification for every connection
+
+### Why Teleport?
+
+| Traditional Kubectl Access | Teleport Access |
+|---------------------------|-----------------|
+| Long-lived tokens/certs in kubeconfig | Short-lived certificates (12h) from GitHub SSO |
+| Static file (`~/.kube/config`) | Dynamic certificate (`~/.tsh/keys/`) |
+| Easy to copy/share (security risk) | Impossible to share (tied to user identity) |
+| Cluster secret rotation required for revocation | Instant revocation via Teleport |
+| Limited audit context in K8s logs | Full session recording with user identity |
+| Multiple kubeconfig contexts | Single `tsh kube login` command |
+| Requires VPN or public endpoint | Reverse tunnel (works behind NAT) |
+| No 2FA/MFA support | GitHub MFA + optional TOTP |
+| Manual certificate rotation | Automatic re-authentication |
+
+---
+
+## Architecture Overview
+
+### High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Teleport Architecture                           │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│   Engineer   │
+│  (tsh CLI /  │
+│   Web UI)    │
+└──────┬───────┘
+       │ 1. Authenticate with GitHub SSO
+       │ 2. Request kubectl access
+       ▼
+┌────────────────────────────────────────────────────────────────┐
+│ Teleport Cluster (Management Cluster)                          │
+│ ┌────────────────┐         ┌──────────────────┐                │
+│ │ Teleport Proxy │◄────────┤ Teleport Auth    │                │
+│ │ - Web UI       │         │ - Cert Authority │                │
+│ │ - API Gateway  │         │ - RBAC Engine    │                │
+│ │ - LoadBalancer │         │ - Audit Log      │                │
+│ └────────┬───────┘         └──────────────────┘                │
+│          │                                                     │
+│          │ teleport.{fqdn}:443 (multiplexed)                   │
+└──────────┼─────────────────────────────────────────────────────┘
+           │
+           │ 3. Reverse tunnel (mTLS)
+           │    Port 3024
+           ▼
+┌───────────────────────────────────────────────────────────────┐
+│ Regional K8s Cluster                                          │
+│ ┌──────────────────────────────────────┐                      │
+│ │ Teleport Kube Agent                  │                      │
+│ │ - Registers cluster with Teleport    │                      │
+│ │ - Proxies kubectl API requests       │                      │
+│ │ - Enforces RBAC policies             │                      │
+│ │ - 3 replicas (HA)                    │                      │
+│ └────────────┬─────────────────────────┘                      │
+│              │                                                │
+│              │ 4. kubectl API requests                        │
+│              ▼                                                │
+│ ┌──────────────────────────────────────┐                      │
+│ │ Kubernetes API Server                │                      │
+│ └──────────────────────────────────────┘                      │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Deployment Model
+
+#### Teleport Cluster (Control Plane)
+
+**Location:** Management clusters (o11y-apps)
+
+| Environment | Cluster Name | Teleport FQDN | Purpose |
+|-------------|--------------|---------------|---------|
+| Staging | o11y-apps-rin1-us-staging | `teleport.infra-o11y-apps.rin1.us.staging.linode.com` | Staging clusters access |
+| Production | o11y-apps-iad3-us-prod | `teleport.infra-o11y-apps.iad3.us.prod.linode.com` | Production clusters access |
+
+**Components:**
+- **Teleport Auth Service** - Certificate authority and RBAC engine
+- **Teleport Proxy Service** - Public-facing gateway (LoadBalancer + external-dns)
+- **Teleport Operator** - Kubernetes operator for managing Teleport resources
+
+**Configuration Details:**
+- **Chart:** `teleport-cluster` v14.0.3
+- **Chart mode:** Standalone (all-in-one deployment)
+- **Proxy listener mode:** Multiplex (all protocols on port 443)
+- **High availability:** 1 auth replica, 2 proxy replicas
+- **Image:** Custom from Linode Artifactory: `linode-docker.artifactory.linode.com/o11y/teleport`
+- **Authentication:** GitHub SSO
+- **External DNS:** Automatic DNS record creation via external-dns
+
+#### Teleport Kube Agent (Data Plane)
+
+**Location:** Every regional Kubernetes cluster (Victoria Metrics, Prometheus, etc.)
+
+**Purpose:**
+- Registers the Kubernetes cluster with Teleport control plane
+- Proxies kubectl API requests from authenticated users
+- Enforces RBAC policies defined in Teleport
+- Provides audit logging for all kubectl commands
+
+**Configuration Details:**
+- **Chart:** `teleport-kube-agent` v14.0.3
+- **Role:** `kube` (Kubernetes access only)
+- **High availability:** 3 replicas with pod anti-affinity
+- **Join method:** Token-based authentication (tokens stored in Vault)
+- **TLS:** Uses Vault-issued Linode CA certificates (`vault-linode-ca`)
+- **Monitoring:** Prometheus PodMonitor enabled (30s scrape interval)
+- **Labels:** Automatically tagged with `environment` and `datacenter`
+
+**Configuration Files:**
+- Teleport Cluster: `https://bits.linode.com/ops/o11y-helm-charts/blob/main/charts/o11y-helm-charts/templates/o11y-apps-applications/teleport-cluster-application.yaml`
+- Teleport Kube Agent: `https://bits.linode.com/ops/o11y-helm-charts/blob/main/charts/o11y-helm-charts/templates/multi-cluster-applications/teleport-kube-agent-application.yaml`
+- Proxy Helper: `https://bits.linode.com/ops/o11y-helm-charts/blob/main/charts/o11y-helm-charts/templates/_helpers.tpl#L164-L171`
+
+---
+
+## Security Model
+
+### Defense-in-Depth Architecture
+
+Teleport is part of a comprehensive **defense-in-depth** security architecture for O11y clusters:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    External Clients (Prometheus, Grafana, etc.)     │
+└────────────────────────┬────────────────────────────────────────────┘
+                         │
+                         │ Layer 1: Source IP Check
+                         ▼
+        ┌────────────────────────────────────────┐
+        │   Linode Cloud Firewall (CFW)          │
+        │   - IP Allowlist (IPv4 + IPv6)         │
+        │   - Applied to NodeBalancer/NIL        │
+        └────────────────┬───────────────────────┘
+                         │
+                         │ Layer 2: Load Balancing
+                         ▼
+        ┌────────────────────────────────────────┐
+        │   Linode NodeBalancer (NIL)            │
+        │   - Proxy Protocol v2                  │
+        │   - ExternalTrafficPolicy: Local       │
+        └────────────────┬───────────────────────┘
+                         │
+                         │ Layer 3: TLS Termination + Client Cert
+                         ▼
+        ┌────────────────────────────────────────┐
+        │   Traefik Ingress Controller           │
+        │   - mTLS with RequireAndVerifyClientCert│
+        │   - Multiple CA trust anchors          │
+        └────────────────┬───────────────────────┘
+                         │
+                         │ Layer 4: Network Policy Enforcement
+                         ▼
+        ┌────────────────────────────────────────┐
+        │   Cilium CNI with Host Firewall        │
+        │   - BPF-based packet filtering         │
+        │   - Identity-based policies            │
+        └────────────────┬───────────────────────┘
+                         │
+                         ▼
+        ┌────────────────────────────────────────┐
+        │   Kubernetes API / Victoria Metrics    │
+        └────────────────────────────────────────┘
+```
+
+### Certificate-Based Authentication
+
+Teleport eliminates shared secrets (SSH keys, kubeconfig tokens) with short-lived certificates:
+
+#### Certificate Lifecycle
+
+```
+1. User authenticates with GitHub SSO
+   ↓
+2. Teleport Auth issues X.509 client certificate
+   ↓
+3. Certificate includes:
+   - User principal (GitHub username)
+   - Roles and permissions
+   - Kubernetes clusters allowed
+   - Expiration timestamp (default: 12 hours)
+   ↓
+4. Certificate automatically expires
+   ↓
+5. User must re-authenticate to get new certificate
+```
+
+#### Benefits of Certificate-Based Auth
+
+- **No long-lived credentials to steal** - Certificates expire automatically
+- **Automatic credential rotation** - No manual rotation needed
+- **Cannot be shared** - Tied to user identity via GitHub SSO
+- **Instant revocation** - Revoke via Teleport (no need to rotate cluster secrets)
+- **Strong authentication** - GitHub MFA enforced
+- **Full audit trail** - Every certificate issuance logged
+
+### Mutual TLS (mTLS)
+
+All communication between Teleport components uses **mutual TLS**:
+
+#### mTLS Implementation
+
+**Teleport Proxy ↔ Teleport Auth:**
+- Both sides present certificates
+- Mutual verification enforced
+- CA: Vault Linode CA (`vault-linode-ca`)
+
+**Teleport Proxy ↔ Teleport Kube Agent:**
+- Reverse tunnel over mTLS (port 3024)
+- Agent presents join token on first connection
+- Subsequent connections use issued certificate
+- CA: Vault Linode CA
+
+**User ↔ Teleport Proxy:**
+- TLS for web UI (port 443)
+- Client certificate required for API access
+- Server certificate issued by Vault or cert-manager
+
+#### Shared Certificate Infrastructure
+
+Teleport shares the **Vault Linode CA** with other O11y services:
+- Traefik ingress mTLS
+- Envoy cross-cluster communication
+- VictoriaMetrics endpoints
+- Consistent trust model across infrastructure
+
+---
+
+## Access Control & RBAC
+
+### Role-Based Access Control (RBAC)
+
+Teleport RBAC is **separate** from Kubernetes RBAC, providing an additional security layer:
+
+#### RBAC Flow
+
+**SRE Observability Team Member**
+
+```
+1. User: member of GitHub team "sre-observability"
+   ↓
+2. Teleport role: "o11y-admin" (assigned to sre-observability team)
+   ↓
+3. Role permissions:
+   - kubernetes_groups: ["system:masters"]
+   - kubernetes_labels:
+       environment: ["prod", "staging"]
+   ↓
+4. User can access: All prod and staging o11y clusters
+   ↓
+5. User kubectl access: Full admin (system:masters)
+   ↓
+6. Kubernetes RBAC: Validates system:masters has permissions
+```
+
+### Audit Logging
+
+Teleport logs **every kubectl command** with complete context:
+
+#### Logged Information
+
+- User identity (GitHub username)
+- Source IP address
+- Timestamp (UTC)
+- Kubernetes cluster accessed
+- Namespace and resource
+- kubectl command and arguments
+- Success/failure status
+- Session duration
+
+#### Audit Log Storage
+
+- **Primary storage:** Teleport Auth pod filesystem
+- **Retention:** Configurable (default: 90 days)
+- **Session replay:** Interactive kubectl sessions can be replayed in web UI
+- **Optional forwarding:** Can forward to external SIEM for compliance
+
+---
+## How Operators Access Clusters
+
+### Step-by-Step Access Guide
+
+#### 1. Install tsh CLI
+
+Download and install the Teleport client (`tsh`):
+
+- **Installation docs:** https://goteleport.com/docs/installation/
+- **Supported platforms:** Linux, macOS, Windows
+
+#### 2. Authenticate to Teleport
+
+**For Production Clusters:**
+
+```bash
+tsh login -k no --proxy=teleport.infra-o11y-apps.iad3.us.prod.linode.com
+```
+
+**For Staging Clusters:**
+
+```bash
+tsh login -k no --proxy=teleport.infra-o11y-apps.rin1.us.staging.linode.com
+```
+
+**What Happens:**
+1. Browser opens with GitHub OAuth login
+2. Authenticate with GitHub credentials (MFA enforced)
+3. Teleport issues 12-hour client certificate
+4. Certificate stored in `~/.tsh/keys/`
+
+#### 3. List Available Clusters
+
+```bash
+tsh kube ls
+```
+
+**Example Output:**
+```
+Kube Cluster Name                    Labels
+------------------------------------ --------------------------------------
+victoriametrics-ord2-us-prod         environment=prod datacenter=ord2-us
+vmselect-ord2-us-prod                environment=prod datacenter=ord2-us
+prometheus-osa1-jp-prod              environment=prod datacenter=osa1-jp
+o11y-apps-iad3-us-prod               environment=prod datacenter=iad3-us
+```
+
+#### 4. Login to Specific Cluster
+
+```bash
+tsh kube login -k no --set-context-name "{{.KubeName}}" victoriametrics-ord2-us-prod
+```
+
+**Pro Tips:**
+
+**Login to all clusters at once:**
+```bash
+tsh kube login -k no --set-context-name '{{.KubeName}}' --all
+```
+
+**Use friendly context names:**
+```bash
+tsh kube login --set-context-name 'vm-prod-ord2' victoriametrics-ord2-us-prod
+```
+
+#### 5. Use kubectl Normally
+
+```bash
+kubectl get nodes
+kubectl get pods -n ns
+kubectl logs -n ns pod-name
+```
+
+### Teleport Web UI Access
+
+Alternatively, access clusters via the Teleport web interface:
+
+**Production:**
+- URL: https://teleport.infra-o11y-apps.iad3.us.prod.linode.com
+- Lists all available clusters
+- Click cluster name to get connection instructions
+- Can copy `tsh` commands directly
+
+**Staging:**
+- URL: https://teleport.infra-o11y-apps.rin1.us.staging.linode.com
+
+### Shell Aliases for Easy Switching
+
+Since staging and production use different Teleport instances:
+
+**Bash/ZSH Aliases:**
+```bash
+alias tsh-stage='tsh login -k no --proxy=teleport.infra-o11y-apps.rin1.us.staging.linode.com'
+alias tsh-prod='tsh login -k no --proxy=teleport.infra-o11y-apps.iad3.us.prod.linode.com'
+```
+
+**TSH Native Aliases:**
+```yaml
+# ~/.tsh/config/config.yaml
+aliases:
+  prod: "tsh login -k no --proxy=teleport.infra-o11y-apps.iad3.us.prod.linode.com:443 teleport.infra-o11y-apps.iad3.us.prod.linode.com"
+  staging: "tsh login -k no --proxy=teleport.infra-o11y-apps.rin1.us.staging.linode.com:443 teleport.infra-o11y-apps.rin1.us.staging.linode.com"
+```
+
+Then use: `tsh prod` or `tsh staging`
+
+### Certificate Status and Renewal
+
+**Check certificate status:**
+```bash
+tsh status
+```
+
+**Example output:**
+```
+sgour@blr-mpz3j ~ % tsh status
+> Profile URL:        https://teleport.infra-o11y-apps.iad3.us.prod.linode.com:443
+  Logged in as:       sgour
+  Cluster:            teleport.infra-o11y-apps.iad3.us.prod.linode.com
+  Roles:              sso-admins
+  Logins:             sgour
+  Kubernetes:         enabled
+  Kubernetes groups:  system:masters
+  Valid until:        2025-12-01 23:34:32 +0530 IST [valid for 12h0m0s]
+  Extensions:         login-ip, permit-port-forwarding, permit-pty, private-key-policy
+
+  Profile URL:        https://teleport.infra-o11y-apps.rin1.us.staging.linode.com:443
+  Logged in as:       sgour
+  Cluster:            teleport.infra-o11y-apps.rin1.us.staging.linode.com
+  Roles:              sso-admins
+  Logins:             sgour
+  Kubernetes:         enabled
+  Kubernetes cluster: "infra-o11y-apps-rin1-us-staging"
+  Kubernetes groups:  system:masters
+  Valid until:        2025-10-14 09:00:43 +0530 IST [EXPIRED]
+  Extensions:         login-ip, permit-port-forwarding, permit-pty, private-key-policy
+```
+
+**Renew certificate (if expired):**
+```bash
+# Re-login to Teleport
+tsh login --proxy=teleport.infra-o11y-apps.iad3.us.prod.linode.com
+
+# Re-login to cluster
+tsh kube login <cluster-name>
+```
+---
+
+## Integration with O11y Security Controls
+
+### Security Control Layers
+
+Teleport is part of a **multi-layered security architecture**:
+
+| Layer | Control | Purpose | Config Location |
+|-------|---------|---------|-----------------|
+| **Network (L3/L4)** |
+| 1 | Cloud Firewall (CFW) | IP allowlisting on NodeBalancers | `traefik-application.yaml` |
+| 2 | Cilium Host Firewall | BPF-based packet filtering on nodes | `cilium-application.yaml` |
+| 3 | Cilium Network Policies | Pod-to-pod access control | `cilium-application.yaml` |
+| **Application (L7)** |
+| 4 | Traefik mTLS | Certificate-based ingress authentication | `traefik-application.yaml` |
+| 5 | Teleport | Identity-aware cluster access | `teleport-cluster-application.yaml` |
+| 6 | Envoy mTLS | Cross-cluster VictoriaMetrics encryption | `vmselect-envoy` chart |
+| **Identity & Access** |
+| 7 | GitHub SSO | User authentication | Teleport config |
+| 8 | Vault PKI | Certificate issuance and rotation | `terraform-vault-config` |
+| 9 | Vault AppRole | Kubernetes service authentication | Vault config |
+
+### Certificate Monitoring
+
+All certificates monitored for expiration:
+
+**Monitoring Tools:**
+- **grafana-client-cert-collector** - Monitors Grafana datasource client certificates
+- **vault_pki_exporter** - Monitors Vault-issued certificates
+- **Prometheus alerts** - Alert on certificates expiring within 30 days
+
+**Certificates Monitored:**
+- Teleport client certificates (user-issued, 12h TTL)
+- Teleport CA certificates (Vault PKI)
+- Traefik mTLS certificates
+- Envoy cross-cluster certificates
+- Kubernetes cluster CA certificates (yearly rotation)
+
+---
+## Vault Integration
+
+### Vault Secrets for Teleport
+
+Teleport relies on **HashiCorp Vault** for secret management:
+
+#### 1. Join Tokens
+
+**Purpose:** Authenticate Teleport Kube Agents when joining Teleport cluster
+
+**Storage Location:**
+```
+infra/{env}/sre-o11y/teleport-join-{cluster-name}
+```
+
+**Key:** `joinToken`
+
+**Properties:**
+- **TTL:** 1 hour (must be used within 1 hour of generation)
+- **Single-use:** Token consumed on first successful join
+- **Not base64 encoded:** Stored as plaintext (helm chart handles encoding)
+
+**Injection:** ArgoCD Vault Plugin injects token into Kube Agent deployment
+
+#### 2. TLS Certificates
+
+**Server Certificate:** `teleport-tls`
+- Used for HTTPS on Teleport Proxy (port 443)
+- Issued by Vault PKI or cert-manager
+- Auto-renewal via cert-manager
+
+**CA Certificate:** `vault-linode-ca`
+- Root CA from Vault PKI
+- Used to verify client certificates
+- Shared with Traefik, Envoy, and other O11y services
+- Mounted in Teleport pods as secret
+
+**Certificate Secret Mounting:**
+```yaml
+tls:
+  existingSecretName: teleport-tls       # Server cert
+  existingCASecretName: vault-linode-ca  # CA cert for mTLS
+```
+
+#### 3. Admin Kubeconfigs (Break-Glass Access)
+
+**Purpose:** Emergency access if Teleport is unavailable
+
+**Storage Location:**
+```
+infra/{env}/sre-o11y/{cluster-name}
+```
+
+**Key:** `kubeconfig`
+
+**Important:**
+- **Only use in emergencies** (e.g., Teleport outage)
+- Admin kubeconfigs bypass all Teleport audit logging
+- Full admin access (system:masters)
+
+### Vault AppRole for ArgoCD
+
+Teleport applications managed by ArgoCD with Vault integration:
+
+**Vault Authentication:**
+- ArgoCD uses Vault AppRole
+- JWT-based authentication from Kubernetes service accounts
+- Short-lived tokens issued
+
+**Secret Injection Workflow:**
+```
+1. ArgoCD detects Teleport application sync
+   ↓
+2. ArgoCD Vault Plugin reads Vault path
+   ↓
+3. Vault validates ArgoCD AppRole JWT
+   ↓
+4. Vault returns join token
+   ↓
+5. ArgoCD injects token into Helm values
+   ↓
+6. Teleport Kube Agent deployed with token
+   ↓
+7. Agent authenticates to Teleport cluster
+```
+
+## References
+### Internal Documentation
+
+**Terraform Observability Team Docs:**
+- Connecting New Clusters: `https://bits.linode.com/ops/terraform-observability-team/blob/main/docs/content/Services/Kubernetes%20Clusters/teleport-kube-agent.md`
+- Kubernetes Deployments Overview: `https://bits.linode.com/ops/terraform-observability-team/blob/main/docs/content/Services/Kubernetes%20Clusters/_index.md`
+- Rotating Secrets: `https://bits.linode.com/ops/terraform-observability-team/blob/main/docs/content/Services/Kubernetes%20Clusters/rotating-secrets.md`
+- Vault Authentication: https://kb.linode.com/display/services/Vault+-+How-to+-+Authenticate+to+the+CLI
+- Teleport Access Guide: https://kb.linode.com/pages/viewpage.action?pageId=151726139
+
+### External Documentation
+
+**Official Teleport Docs:**
+- Main Documentation: https://goteleport.com/docs/
+- Kubernetes Access: https://goteleport.com/docs/kubernetes-access/introduction/
+- Helm Chart Reference (teleport-kube-agent): https://goteleport.com/docs/reference/helm-reference/teleport-kube-agent/
+- GitHub SSO: https://goteleport.com/docs/access-controls/sso/github/
+- Access Requests: https://goteleport.com/features/access-requests/
+- RBAC Configuration: https://goteleport.com/docs/access-controls/reference/
+
+### Support
+
+**For Questions or Issues:**
+- Slack: `#sre-observability`
